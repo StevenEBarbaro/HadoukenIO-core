@@ -49,6 +49,9 @@ limitations under the License.
         frames
     } = glbl.__startOptions;
 
+    //Check if we need to use the process.eval in a nodeless environment.
+    const geval = initialOptions.experimental.node ? glbl.eval : glbl.process.eval;
+
     // The following will check whether it is an iframe and update
     // entity information accordingly
     const frameInfo = frames.find(e => e.frameRoutingId === renderFrameId);
@@ -542,6 +545,45 @@ limitations under the License.
     });
 
     /**
+     * Request plugin modules from the Core and execute them in the current window
+     */
+    function evalPlugins(uuid, name) {
+        const action = 'set-window-plugin-state';
+        const plugins = syncApiCall('get-plugin-modules');
+        const log = (msg) => {
+            asyncApiCall('write-to-log', {
+                level: 'info',
+                message: `[plugins] [${uuid}]-[${name}]: ${msg}`
+            });
+        };
+
+        plugins.forEach((plugin) => {
+            // _content: contains plugin module code as a string to eval in this window
+            const { name, version, _content } = plugin;
+
+            if (!_content) {
+                log(`Skipped execution of plugin module [${name} ${version}], ` +
+                    `because the content is not available`);
+                return;
+            }
+
+            try {
+                geval(_content); /* jshint ignore:line */
+                log(`Succeeded execution of plugin module [${name} ${version}]`);
+                asyncApiCall(action, { name, version, state: 'succeeded' });
+            } catch (error) {
+                window.console.error(`${error.name}: ${error.message}\nPlugin: ${name} ${version}`);
+                log(`Failed execution of plugin module [${name} ${version}]`);
+                asyncApiCall(action, { name, version, state: 'failed' });
+            }
+        });
+
+        asyncApiCall(action, { allDone: true });
+    }
+
+
+
+    /**
      * Request preload scripts from the Core and execute them in the current window
      */
     function evalPreloadScripts(uuid, name) {
@@ -585,7 +627,7 @@ limitations under the License.
                 }
 
                 try {
-                    process.eval(_content); /* jshint ignore:line */
+                    geval(_content); /* jshint ignore:line */
                     log(`Succeeded execution of preload script for URL [${url}]`);
                     asyncApiCall(action, { url, state: 'succeeded' });
                 } catch (error) {
