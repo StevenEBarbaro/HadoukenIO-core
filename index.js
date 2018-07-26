@@ -29,6 +29,12 @@ let globalShortcut = electron.globalShortcut;
 let ipc = electron.ipcMain;
 let Menu = electron.Menu;
 
+const v8 = require('v8');
+v8.setFlagsFromString('--trace_gc_verbose');
+app.commandLine.appendSwitch('js-flags', '--trace_gc_verbose');
+v8.setFlagsFromString('--trace_gc');
+app.commandLine.appendSwitch('js-flags', '--trace_gc');
+
 // npm modules
 let _ = require('underscore');
 let minimist = require('minimist');
@@ -257,6 +263,13 @@ app.on('chrome-browser-process-created', function() {
 // This method will be called when Electron has finished
 // initialization and is ready to create browser windows.
 app.on('ready', function() {
+    const printTime = () => {
+        app.vlog(1, `process.uptime: ${Math.floor(process.uptime() * 1000)} ms`);
+        setTimeout(printTime, 1000);
+    };
+
+    printTime();
+
     appIsReady = true;
 
     if (otherInstanceRunning) {
