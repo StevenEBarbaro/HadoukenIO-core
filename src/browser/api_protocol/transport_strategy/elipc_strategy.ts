@@ -19,6 +19,7 @@ import { default as RequestHandler } from './base_handler';
 import { Endpoint, ActionMap } from '../shapes';
 import { Identity } from '../../../shapes';
 import * as log from '../../log';
+import { getIdentityFromObject } from '../../../common/main';
 
 declare var require: any;
 
@@ -29,6 +30,14 @@ const system = require('../../api/system').System;
 // this represents the future default behavior, here its opt-in
 const frameStrategy = coreState.argo.framestrategy;
 const bypassLocalFrameConnect = frameStrategy === 'frames';
+
+
+interface BufferedMessages {
+    identity: Identity;
+    frameRoutingId: number;
+    key: string;
+    messages: Array<string>;
+}
 
 export class ElipcStrategy extends ApiTransportBase<MessagePackage> {
 
@@ -70,25 +79,20 @@ export class ElipcStrategy extends ApiTransportBase<MessagePackage> {
         electronIpc.ipc.on(electronIpc.channels.WINDOW_MESSAGE, this.onMessage.bind(this));
     }
 
-    public send(identity: Identity, payloadObj: any): void {
-        const { uuid, name } = identity;
-        const routingInfo = coreState.getRoutingInfoByUuidFrame(uuid, name);
-
-        if (!routingInfo) {
-            system.debugLog(1, `Routing info for uuid:${uuid} name:${name} not found`);
-            return;
-        }
-
+    private canTrySend(routingInfo: any): boolean {
         const { browserWindow, frameRoutingId } = routingInfo;
-        const payload = JSON.stringify(payloadObj);
         const browserWindowLocated = browserWindow;
         const browserWindowExists = !browserWindow.isDestroyed();
         const validRoutingId = typeof frameRoutingId === 'number';
-        const canTrySend = browserWindowLocated && browserWindowExists && validRoutingId;
+        return browserWindowLocated && browserWindowExists && validRoutingId;
+    }
 
-        if (!canTrySend) {
-            system.debugLog(1, `uuid:${uuid} name:${name} frameRoutingId:${frameRoutingId} not reachable, payload:${payload}`);
-        } else if (frameRoutingId === routingInfo.mainFrameRoutingId) {
+    private innerSend(payload: string,
+                      frameRoutingId: number,
+                      mainFrameRoutingId: number,
+                      browserWindow: any): void {
+        // Dispatch the message
+        if (frameRoutingId === mainFrameRoutingId) {
             // this is the main window frame
             if (coreState.argo.framestrategy === 'frames') {
                 browserWindow.webContents.sendToFrame(frameRoutingId, electronIpc.channels.CORE_MESSAGE, payload);
@@ -98,6 +102,104 @@ export class ElipcStrategy extends ApiTransportBase<MessagePackage> {
         } else {
             // frameRoutingId != browserWindow.webContents.mainFrameRoutingId implies a frame
             browserWindow.webContents.sendToFrame(frameRoutingId, electronIpc.channels.CORE_MESSAGE, payload);
+        }
+    }
+
+    private delayedMessageHandler(bufferedMessages: BufferedMessages): void {
+        const { uuid, name } = bufferedMessages.identity;
+        const routingInfo = coreState.getRoutingInfoByUuidFrame(uuid, name);
+
+        if (!routingInfo) {
+            system.debugLog(1, `Routing info for uuid:${uuid} name:${name} not found`);
+            return;
+        }
+
+        const { browserWindow, frameRoutingId, mainFrameRoutingId } = routingInfo;
+        const canTrySend = this.canTrySend(routingInfo);
+
+        if (!canTrySend) {
+            const pred1 = `uuid:${uuid} name:${name} frameRoutingId:${frameRoutingId} not reachable, `;
+            const pred2 = `payload:${JSON.stringify(bufferedMessages.messages)}`;
+            system.debugLog(1, `${pred1}{$pred2}`);
+        } else {
+            const batchMessage = {
+                action: 'process-api-batch',
+                payload: {
+                    messages: bufferedMessages.messages
+                }
+            };
+
+            //bufferedMessages.messages.forEach((m: any) => {
+            //    const payload = m;
+                this.innerSend(JSON.stringify(batchMessage), frameRoutingId, mainFrameRoutingId, browserWindow);
+            //});
+        }
+    }
+
+    private bufferedMessageHandler = new class {
+
+        private pendingMessages: any = {};
+        private pendingFlush: boolean = false;
+        private handler: (bufferedMessages: BufferedMessages) => void;
+
+        constructor(handler: any) {
+            this.handler = handler;
+        }
+
+        private flush(): void {
+            Object.keys(this.pendingMessages).forEach((key: string) => {
+                const bufferedMessages = this.pendingMessages[key];
+                this.handler(bufferedMessages);
+                bufferedMessages.messages = [];
+            });
+
+            this.pendingFlush = false;
+        }
+
+        public add(key: string, identity: any, frameRoutingId: number, payload: string): void {
+            if (!this.pendingFlush) {
+                setImmediate(() => { this.flush(); });
+            }
+
+            const entry = (this.pendingMessages[key] = this.pendingMessages[key] || {
+                identity,
+                frameRoutingId,
+                key,
+                messages: []
+            });
+
+            entry.messages.push(payload);
+        }
+    }(this.delayedMessageHandler.bind(this));
+
+    public send(identity: Identity, payloadObj: any): void {
+        const { uuid, name } = identity;
+        const routingInfo = coreState.getRoutingInfoByUuidFrame(uuid, name);
+
+        if (!routingInfo) {
+            system.debugLog(1, `Routing info for uuid:${uuid} name:${name} not found`);
+            return;
+        }
+
+        const { browserWindow, mainFrameRoutingId, frameRoutingId } = routingInfo;
+        const payload = JSON.stringify(payloadObj);
+
+        // Example: Fallback to direct message if not buffering for this window
+        const buffer = true;
+        if (!buffer) {
+            if (!this.canTrySend(routingInfo)) {
+                const pred1 = `uuid:${uuid} name:${name} frameRoutingId:${frameRoutingId} not reachable, payload:${payload}`;
+                system.debugLog(1, `uuid:${uuid} name:${name} frameRoutingId:${frameRoutingId} not reachable, payload:${payload}`);
+            } else {
+                this.innerSend(payload, frameRoutingId, mainFrameRoutingId, browserWindow);
+            }
+        } else {
+            // Queue it up
+            const bufferKey = `${(!browserWindow.isDestroyed() ? browserWindow.id : -1)} - ${frameRoutingId}`;
+            this.bufferedMessageHandler.add(bufferKey,
+                                            identity,
+                                            frameRoutingId,
+                                            payload);
         }
     }
 
@@ -263,7 +365,24 @@ export class ElipcStrategy extends ApiTransportBase<MessagePackage> {
                     time: Date.now()
                 });
 
-                e.sender.sendToFrame(e.frameRoutingId, electronIpc.channels.CORE_MESSAGE, JSON.stringify(ackObj));
+                // Example: Fallback to direct message if not buffering for this window
+                const buffer = true;
+                if (!buffer) {
+                    e.sender.sendToFrame(e.frameRoutingId,
+                                         electronIpc.channels.CORE_MESSAGE,
+                                         JSON.stringify(ackObj));
+                } else {
+                    const browserWindow = e.sender.getOwnerBrowserWindow();
+                    const frameRoutingId = e.frameRoutingId;
+                    const bufferKey = `${(!browserWindow.isDestroyed() ? browserWindow.id : -1)} - ${frameRoutingId}`;
+                    const ofWindow = coreState.getWinById(browserWindow.id);
+                    const identity = getIdentityFromObject(ofWindow.openfinWindow);
+
+                    this.bufferedMessageHandler.add(bufferKey,
+                                identity,
+                                frameRoutingId,
+                                JSON.stringify(ackObj));
+                }
 
                 // ToDo track outbound statistics
                 /*ackObj.breadcrumbs.push({
